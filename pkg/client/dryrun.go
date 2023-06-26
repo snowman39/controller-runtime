@@ -57,6 +57,11 @@ func (c *dryRunClient) IsObjectNamespaced(obj runtime.Object) (bool, error) {
 	return c.client.IsObjectNamespaced(obj)
 }
 
+// Commit implements client.Client.
+func (c *dryRunClient) Commit(ctx context.Context, cmp []runtime.Object, req []runtime.Object) error {
+	return nil
+}
+
 // Create implements client.Client.
 func (c *dryRunClient) Create(ctx context.Context, obj Object, opts ...CreateOption) error {
 	return c.client.Create(ctx, obj, append(opts, DryRunAll)...)

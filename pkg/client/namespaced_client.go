@@ -62,6 +62,11 @@ func (n *namespacedClient) IsObjectNamespaced(obj runtime.Object) (bool, error) 
 	return n.client.IsObjectNamespaced(obj)
 }
 
+// Commit implements client.Client.
+func (n *namespacedClient) Commit(ctx context.Context, cmp []runtime.Object, req []runtime.Object) error {
+	return nil
+}
+
 // Create implements client.Client.
 func (n *namespacedClient) Create(ctx context.Context, obj Object, opts ...CreateOption) error {
 	isNamespaceScoped, err := n.IsObjectNamespaced(obj)

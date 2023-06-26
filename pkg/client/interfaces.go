@@ -170,6 +170,7 @@ type Client interface {
 	Scheme() *runtime.Scheme
 	// RESTMapper returns the rest this client is using.
 	RESTMapper() meta.RESTMapper
+	Commit(ctx context.Context, cmp []runtime.Object, req []runtime.Object) error
 	// GroupVersionKindFor returns the GroupVersionKind for the given object.
 	GroupVersionKindFor(obj runtime.Object) (schema.GroupVersionKind, error)
 	// IsObjectNamespaced returns true if the GroupVersionKind of the object is namespaced.

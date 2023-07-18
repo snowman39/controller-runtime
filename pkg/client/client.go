@@ -20,9 +20,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"bytes"
 	"net/http"
 	"strings"
 	"strconv"
+	"encoding/json"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -272,107 +274,69 @@ func (c *client) RESTMapper() meta.RESTMapper {
 	return c.mapper
 }
 
+type TxnRequest struct {
+	Compare map[string]uint64
+	Request map[string][]byte
+}
+
+var keyPrefix string = "/registry/"
+
 // Commit implements client.Client.
 func (c *client) Commit(ctx context.Context, cmp []runtime.Object, req []runtime.Object) error {
 	if len := len(req); len == 0 {
 		return nil
 	}
 
-	// Add compare contents, from get response object
-	var compareList []uint64 // (key(str), rv(uint64))
+	compares := make(map[string]uint64)
 	for i := 0; i < len(cmp); i++ {
 		obj := cmp[i]
-		accessor, err := meta.Accessor(obj)
-		if err != nil {
-			return err
-		}
-		version := accessor.GetResourceVersion()
-		if len(version) == 0 {
-			return nil
-		}
-		resourceVersion, _ := strconv.ParseUint(version, 10, 64)
-		compareList = append(compareList, resourceVersion)
+		key, resourceVersion := GetResourceVersionKV(obj)
+		compares[key] = resourceVersion
 	}
 
-	// let's assume everything is update(PUT) for now, update, create, delete info needed later
-	var requestList []*rest.Request
+	requests := make(map[string][]byte)
+
+	// assume everything is update(PUT) for now
 	for i := 0; i < len(req); i++ {
-		obj := req[i]
-		// TODO: for unstructured resources
-		o, err := c.typedClient.resources.getObjMeta(obj) 
-		if err != nil {
-			return err
-		}
-		updateOpts := &UpdateOptions{}
-		newRequest := o.Put().
-			NamespaceIfScoped(o.GetNamespace(), o.isNamespaced()).
-			Resource(o.resource()).
-			Name(o.GetName()).
-			Body(obj).
-			VersionedParams(updateOpts.AsUpdateOptions(), c.typedClient.paramCodec)
-
-		requestList = append(requestList, newRequest)
+		obj := req[i]		
+		key := GetObjectKey(obj)
+		data := runtime.Encode(c.typedClient.resources.codecs, obj)
+		requests[key] = data
 	}
-	fmt.Println(compareList[0])
-	fmt.Println(requestList[0].URL())
 
-	// obj := req[0]
-	// o, _ := c.typedClient.resources.getObjMeta(obj)
-	
-	// o.Verb("TXN").Do(ctx).Into(obj)
-	// fmt.Println(obj)
-	
-
-	// how do I get body?
-	// now we have request list, so we have to change this to etcdv3 txn requestOp, and http request
-
-	return nil
-	/*
-	// Set the etcd server URL
-	url := "http://your-etcd-server:2379/v3alpha/kv/txn"
-
-	// Create the transaction request payload
 	txnRequest := &TxnRequest{
-		Success: []*RequestOp{
-			// Define your successful operations here
-			// For example, a put operation:
-			// &RequestOp{OpPut: &PutOp{Key: "key1", Value: "value1"}},
-			// or a delete operation:
-			// &RequestOp{OpDeleteRange: &DeleteRangeOp{Key: "key2"}},
-		},
-		Failure: []*RequestOp{
-			// Define your failed operations here (optional)
-		},
+		Compare: compares,
+		Request: requests,
 	}
 
-	// Convert the transaction request to JSON
 	payload, err := json.Marshal(txnRequest)
 	if err != nil {
 		fmt.Println("Error marshaling JSON:", err)
-		return
+		return err
 	}
-
-	// Create a new HTTP client
-	client := &http.Client{}
 
 	// Create a new HTTP request with POST method and payload
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(payload))
+	url := "https://10.224.4.161:6443/apis/abc.abc.io/v1/namespaces/default/abcs/txn"
+	httpRequest, err := http.NewRequest("POST", url, bytes.NewBuffer(payload))
 	if err != nil {
 		fmt.Println("Error creating request:", err)
-		return
+		return err
 	}
 
-	// Set the appropriate headers for the request
-	req.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Content-Type", "application/json")
 
 	// Send the request to the etcd server
-	resp, err := client.Do(req)
+	resp, err := c.typedClient.resources.httpClient.Do(httpRequest)
 	if err != nil {
 		fmt.Println("Error sending request:", err)
-		return
+		return err
 	}
 	defer resp.Body.Close()
 
+	fmt.Println("Request:", txnRequest)
+	fmt.Println("Response:", resp)
+
+	/*
 	// Read the response body
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
@@ -384,6 +348,36 @@ func (c *client) Commit(ctx context.Context, cmp []runtime.Object, req []runtime
 	fmt.Println("Response status code:", resp.StatusCode)
 	fmt.Println("Response body:", string(body))
 	*/
+
+	return nil
+}
+
+func GetResourceVersionKV(obj runtime.Object) (string, uint64) {
+	accessor, err := meta.Accessor(obj)
+	if err != nil {
+		return "", 0
+	}
+
+	version := accessor.GetResourceVersion()
+	if len(version) == 0 {
+		return "", 0
+	}
+	resourceVersion, _ := strconv.ParseUint(version, 10, 64)
+	key := GetObjectKey(obj)
+	
+	return key, resourceVersion
+}
+
+func GetObjectKey(obj runtime.Object) string {
+	accessor, err := meta.Accessor(obj)
+	if err != nil {
+		return ""
+	}
+
+	objGroup := "abc.abc.io"
+	objPlural := "abcs"
+	key := keyPrefix + objGroup + "/" + objPlural + "/" + accessor.GetNamespace() + "/" + accessor.GetName()
+	return key
 }
 
 // Create implements client.Client.

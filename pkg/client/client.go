@@ -207,6 +207,16 @@ func newClient(config *rest.Config, options Options) (*client, error) {
 
 var _ Client = &client{}
 
+type TxnBuffer struct {
+	Compare  []runtime.Object
+	Request []runtime.Object
+}
+
+type TxnRequest struct {
+	Compare map[string]uint64
+	Request map[string][]byte
+}
+
 // client is a client.Client that reads and writes directly from/to an API server.
 // It lazily initializes new clients at the time they are used.
 type client struct {
@@ -219,6 +229,8 @@ type client struct {
 	cache             Reader
 	uncachedGVKs      map[schema.GroupVersionKind]struct{}
 	cacheUnstructured bool
+
+	txnBuffer		  TxnBuffer
 }
 
 func (c *client) shouldBypassCache(obj runtime.Object) (bool, error) {
@@ -274,18 +286,15 @@ func (c *client) RESTMapper() meta.RESTMapper {
 	return c.mapper
 }
 
-type TxnRequest struct {
-	Compare map[string]uint64
-	Request map[string][]byte
-}
-
-var keyPrefix string = "/registry/"
-
 // Commit implements client.Client.
 func (c *client) Commit(ctx context.Context, cmp []runtime.Object, req []runtime.Object) error {
-	if len := len(req); len == 0 {
-		return nil
-	}
+	// if len := len(req); len == 0 {
+	// 	return nil
+	// }
+	fmt.Printf("\nNUMBER OF COMPARE %d\nNUMBER OF REQUEST %d\n\n", len(c.txnBuffer.Compare), len(c.txnBuffer.Request))
+	c.txnBuffer.Compare = []runtime.Object{}
+	c.txnBuffer.Request = []runtime.Object{}
+	return nil
 
 	compares := make(map[string]uint64)
 	for i := 0; i < len(cmp); i++ {
@@ -300,8 +309,9 @@ func (c *client) Commit(ctx context.Context, cmp []runtime.Object, req []runtime
 	for i := 0; i < len(req); i++ {
 		obj := req[i]		
 		key := GetObjectKey(obj)
-		data := runtime.Encode(c.typedClient.resources.codecs, obj)
-		requests[key] = data
+		// data, _ := runtime.Encode(c.typedClient.resources.codecs, obj)
+		// requests[key] = "data"
+		fmt.Println(key)
 	}
 
 	txnRequest := &TxnRequest{
@@ -376,12 +386,15 @@ func GetObjectKey(obj runtime.Object) string {
 
 	objGroup := "abc.abc.io"
 	objPlural := "abcs"
-	key := keyPrefix + objGroup + "/" + objPlural + "/" + accessor.GetNamespace() + "/" + accessor.GetName()
+	key := "/registry/" + objGroup + "/" + objPlural + "/" + accessor.GetNamespace() + "/" + accessor.GetName()
 	return key
 }
 
 // Create implements client.Client.
 func (c *client) Create(ctx context.Context, obj Object, opts ...CreateOption) error {
+	c.txnBuffer.Compare = append(c.txnBuffer.Compare, obj)
+	c.txnBuffer.Request = append(c.txnBuffer.Request, obj)
+
 	switch obj.(type) {
 	case runtime.Unstructured:
 		return c.unstructuredClient.Create(ctx, obj, opts...)
@@ -394,6 +407,9 @@ func (c *client) Create(ctx context.Context, obj Object, opts ...CreateOption) e
 
 // Update implements client.Client.
 func (c *client) Update(ctx context.Context, obj Object, opts ...UpdateOption) error {
+	c.txnBuffer.Compare = append(c.txnBuffer.Compare, obj)
+	c.txnBuffer.Request = append(c.txnBuffer.Request, obj)
+
 	defer c.resetGroupVersionKind(obj, obj.GetObjectKind().GroupVersionKind())
 	switch obj.(type) {
 	case runtime.Unstructured:
@@ -407,6 +423,9 @@ func (c *client) Update(ctx context.Context, obj Object, opts ...UpdateOption) e
 
 // Delete implements client.Client.
 func (c *client) Delete(ctx context.Context, obj Object, opts ...DeleteOption) error {
+	c.txnBuffer.Compare = append(c.txnBuffer.Compare, obj)
+	c.txnBuffer.Request = append(c.txnBuffer.Request, obj)
+
 	switch obj.(type) {
 	case runtime.Unstructured:
 		return c.unstructuredClient.Delete(ctx, obj, opts...)
@@ -431,6 +450,9 @@ func (c *client) DeleteAllOf(ctx context.Context, obj Object, opts ...DeleteAllO
 
 // Patch implements client.Client.
 func (c *client) Patch(ctx context.Context, obj Object, patch Patch, opts ...PatchOption) error {
+	c.txnBuffer.Compare = append(c.txnBuffer.Compare, obj)
+	c.txnBuffer.Request = append(c.txnBuffer.Request, obj)
+
 	defer c.resetGroupVersionKind(obj, obj.GetObjectKind().GroupVersionKind())
 	switch obj.(type) {
 	case runtime.Unstructured:
@@ -444,6 +466,8 @@ func (c *client) Patch(ctx context.Context, obj Object, patch Patch, opts ...Pat
 
 // Get implements client.Client.
 func (c *client) Get(ctx context.Context, key ObjectKey, obj Object, opts ...GetOption) error {
+	c.txnBuffer.Compare = append(c.txnBuffer.Compare, obj)
+
 	if isUncached, err := c.shouldBypassCache(obj); err != nil {
 		return err
 	} else if !isUncached {

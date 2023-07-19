@@ -25,6 +25,7 @@ type Funcs struct {
 	SubResourceCreate func(ctx context.Context, client client.Client, subResourceName string, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error
 	SubResourceUpdate func(ctx context.Context, client client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error
 	SubResourcePatch  func(ctx context.Context, client client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error
+	Commit func(ctx context.Context, cmp []runtime.Object, req []runtime.Object) error
 }
 
 // NewClient returns a new interceptor client that calls the functions in funcs instead of the underlying client's methods, if they are not nil.
@@ -48,6 +49,10 @@ func (c interceptor) GroupVersionKindFor(obj runtime.Object) (schema.GroupVersio
 
 func (c interceptor) IsObjectNamespaced(obj runtime.Object) (bool, error) {
 	return c.client.IsObjectNamespaced(obj)
+}
+
+func (c interceptor) Commit(ctx context.Context, cmp []runtime.Object, req []runtime.Object) error {
+	return nil
 }
 
 func (c interceptor) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {

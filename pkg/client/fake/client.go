@@ -461,7 +461,7 @@ func (t versionedTracker) update(gvr schema.GroupVersionResource, obj runtime.Ob
 	return t.ObjectTracker.Update(gvr, obj, ns)
 }
 
-func (c *fakeClient) Commit(ctx context.Context, cmp []runtime.Object, req []runtime.Object) error {
+func (c *fakeClient) Commit(ctx context.Context) error {
 	return nil
 }
 

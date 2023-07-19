@@ -287,7 +287,7 @@ func (c *client) RESTMapper() meta.RESTMapper {
 }
 
 // Commit implements client.Client.
-func (c *client) Commit(ctx context.Context, cmp []runtime.Object, req []runtime.Object) error {
+func (c *client) Commit(ctx context.Context) error {
 	// if len := len(req); len == 0 {
 	// 	return nil
 	// }

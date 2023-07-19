@@ -51,7 +51,7 @@ func (c interceptor) IsObjectNamespaced(obj runtime.Object) (bool, error) {
 	return c.client.IsObjectNamespaced(obj)
 }
 
-func (c interceptor) Commit(ctx context.Context, cmp []runtime.Object, req []runtime.Object) error {
+func (c interceptor) Commit(ctx context.Context) error {
 	return nil
 }
 

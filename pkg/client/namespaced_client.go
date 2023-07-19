@@ -63,7 +63,7 @@ func (n *namespacedClient) IsObjectNamespaced(obj runtime.Object) (bool, error) 
 }
 
 // Commit implements client.Client.
-func (n *namespacedClient) Commit(ctx context.Context, cmp []runtime.Object, req []runtime.Object) error {
+func (n *namespacedClient) Commit(ctx context.Context) error {
 	return nil
 }
 

@@ -24,7 +24,9 @@ import (
 	"net/http"
 	"strings"
 	"strconv"
-	"encoding/json"
+	"gopkg.in/yaml.v3"
+	"time"
+	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -168,6 +170,14 @@ func newClient(config *rest.Config, options Options) (*client, error) {
 		return nil, fmt.Errorf("unable to construct metadata-only client for use as part of client: %w", err)
 	}
 
+	etcdClient, err := clientv3.New(clientv3.Config{
+		Endpoints:   []string{"10.224.4.175:2379", "10.224.4.176:22379", "10.224.4.177:32379"},
+		DialTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("etcd client failed.")
+	}
+
 	c := &client{
 		typedClient: typedClient{
 			resources:  resources,
@@ -183,6 +193,7 @@ func newClient(config *rest.Config, options Options) (*client, error) {
 		},
 		scheme: options.Scheme,
 		mapper: options.Mapper,
+		etcdClient: etcdClient,
 	}
 	if options.Cache == nil || options.Cache.Reader == nil {
 		return c, nil
@@ -207,14 +218,13 @@ func newClient(config *rest.Config, options Options) (*client, error) {
 
 var _ Client = &client{}
 
-type TxnBuffer struct {
-	Compare  []runtime.Object
-	Request []runtime.Object
+type ReconciledObject struct {
+	Object runtime.Object
+	Action string
 }
 
-type TxnRequest struct {
-	Compare map[string]uint64
-	Request map[string][]byte
+type TxnBuffer struct {
+	ReconciledObjects []ReconciledObject
 }
 
 // client is a client.Client that reads and writes directly from/to an API server.
@@ -231,6 +241,7 @@ type client struct {
 	cacheUnstructured bool
 
 	txnBuffer		  TxnBuffer
+	etcdClient		  *clientv3.Client
 }
 
 func (c *client) shouldBypassCache(obj runtime.Object) (bool, error) {
@@ -286,65 +297,138 @@ func (c *client) RESTMapper() meta.RESTMapper {
 	return c.mapper
 }
 
+const TESTING = false
+
+func (c *client) TransformObjectToETCDValue(obj runtime.Object) (string, error) {
+	const mediaType = runtime.ContentTypeYAML
+	info, ok := runtime.SerializerInfoForMediaType(c.typedClient.resources.codecs.SupportedMediaTypes(), mediaType)
+	if !ok {
+		return "", fmt.Errorf("unable to locate encoder -- %q is not a supported media type", mediaType)
+	}
+
+	objectGroup := obj.GetObjectKind().GroupVersionKind().Group
+	objectVersion := obj.GetObjectKind().GroupVersionKind().Version
+	groupVersion := schema.GroupVersion{Group: objectGroup, Version: objectVersion}
+
+	encoder := c.typedClient.resources.codecs.EncoderForVersion(info.Serializer, groupVersion)
+	var buf bytes.Buffer
+	err := encoder.Encode(obj, &buf)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode object: %v", err)
+	}
+
+	// Serialize the etcd value.
+	serializedValue, err := yaml.Marshal(buf.String())
+	if err != nil {
+		return "", fmt.Errorf("failed to serialize etcd value: %v", err)
+	}
+
+	slices := strings.Split(string(serializedValue), "\n")
+	objectYaml := ""
+	for i := 1; i <len(slices); i++ {
+		if len(slices[i]) >= 4 {
+			objectYaml += slices[i][4:] + "\n"
+		}
+	}
+
+	return objectYaml, nil
+}
+
 // Commit implements client.Client.
 func (c *client) Commit(ctx context.Context) error {
-	// if len := len(req); len == 0 {
-	// 	return nil
-	// }
-	fmt.Printf("\nNUMBER OF COMPARE %d\nNUMBER OF REQUEST %d\n\n", len(c.txnBuffer.Compare), len(c.txnBuffer.Request))
-	c.txnBuffer.Compare = []runtime.Object{}
-	c.txnBuffer.Request = []runtime.Object{}
+	fmt.Printf("\nNUMBER OF RECONCILED OBJECTS: %d\n\n", len(c.txnBuffer.ReconciledObjects))
+
+	compares := make(map[string]int64)
+	requests := make(map[string]string)
+
+	for i := 0; i < len(c.txnBuffer.ReconciledObjects); i++ {
+		reconciledObject := c.txnBuffer.ReconciledObjects[i]
+		key, resourceVersion := GetKeyResourceVersion(reconciledObject.Object)
+		switch reconciledObject.Action {
+		case "CREATE":
+			compares[key] = int64(0)
+			value, err := c.TransformObjectToETCDValue(reconciledObject.Object)
+			if err != nil {
+				return err
+			}
+			requests[key] = value
+		case "DELETE":
+			compares[key] = resourceVersion
+			requests[key] = ""
+		case "GET":
+			compares[key] = resourceVersion
+		// UPDATE, PATCH
+		default:
+			compares[key] = resourceVersion
+			value, err := c.TransformObjectToETCDValue(reconciledObject.Object)
+			if err != nil {
+				return err
+			}
+			requests[key] = value
+		}
+	}
+
+	etcdCompares := []clientv3.Cmp{}
+	for key, rv := range compares {
+		etcdCompares = append(etcdCompares, clientv3.Compare(clientv3.ModRevision(key), "=", rv))
+	}
+
+	etcdRequests := []clientv3.Op{}
+	for key, value := range requests {
+		if value == "" {
+			etcdRequests = append(etcdRequests, clientv3.OpDelete(key))	
+		} else {
+			etcdRequests = append(etcdRequests, clientv3.OpPut(key, value))
+		}
+	}
+
+	txnResponse, _ := c.etcdClient.KV.Txn(ctx).If(
+		etcdCompares...,
+	).Then(
+		etcdRequests...,
+	).Else(
+	).Commit()
+	
+	if txnResponse.Succeeded {
+		fmt.Println("Transaction succeeded. Key was either created or updated.")
+	} else {
+		fmt.Println("Transaction failed. No updates were made.")
+	}
+
+	c.txnBuffer.ReconciledObjects = []ReconciledObject{}
 	return nil
 
-	compares := make(map[string]uint64)
-	for i := 0; i < len(cmp); i++ {
-		obj := cmp[i]
-		key, resourceVersion := GetResourceVersionKV(obj)
-		compares[key] = resourceVersion
-	}
+	// txnRequest := &TxnRequest{
+	// 	Compare: compares,
+	// 	Request: requests,
+	// }
 
-	requests := make(map[string][]byte)
-
-	// assume everything is update(PUT) for now
-	for i := 0; i < len(req); i++ {
-		obj := req[i]		
-		key := GetObjectKey(obj)
-		// data, _ := runtime.Encode(c.typedClient.resources.codecs, obj)
-		// requests[key] = "data"
-		fmt.Println(key)
-	}
-
-	txnRequest := &TxnRequest{
-		Compare: compares,
-		Request: requests,
-	}
-
-	payload, err := json.Marshal(txnRequest)
-	if err != nil {
-		fmt.Println("Error marshaling JSON:", err)
-		return err
-	}
+	// payload, err := json.Marshal(txnRequest)
+	// if err != nil {
+	// 	fmt.Println("Error marshaling JSON:", err)
+	// 	return err
+	// }
 
 	// Create a new HTTP request with POST method and payload
-	url := "https://10.224.4.161:6443/apis/abc.abc.io/v1/namespaces/default/abcs/txn"
-	httpRequest, err := http.NewRequest("POST", url, bytes.NewBuffer(payload))
-	if err != nil {
-		fmt.Println("Error creating request:", err)
-		return err
-	}
+	// url := "https://10.224.4.161:6443/apis/abc.abc.io/v1/namespaces/default/abcs/txn"
+	// httpRequest, err := http.NewRequest("POST", url, bytes.NewBuffer(payload))
+	// if err != nil {
+	// 	fmt.Println("Error creating request:", err)
+	// 	return err
+	// }
 
-	httpRequest.Header.Set("Content-Type", "application/json")
+	// httpRequest.Header.Set("Content-Type", "application/json")
 
-	// Send the request to the etcd server
-	resp, err := c.typedClient.resources.httpClient.Do(httpRequest)
-	if err != nil {
-		fmt.Println("Error sending request:", err)
-		return err
-	}
-	defer resp.Body.Close()
+	// // Send the request to the etcd server
+	// resp, err := c.typedClient.resources.httpClient.Do(httpRequest)
+	// if err != nil {
+	// 	fmt.Println("Error sending request:", err)
+	// 	return err
+	// }
+	// defer resp.Body.Close()
 
-	fmt.Println("Request:", txnRequest)
-	fmt.Println("Response:", resp)
+	// fmt.Println("Request:", txnRequest)
+	// fmt.Println("Response:", resp)
 
 	/*
 	// Read the response body
@@ -359,15 +443,14 @@ func (c *client) Commit(ctx context.Context) error {
 	fmt.Println("Response body:", string(body))
 	*/
 
-	return nil
+	// return nil
 }
 
-func GetResourceVersionKV(obj runtime.Object) (string, uint64) {
+func GetKeyResourceVersion(obj runtime.Object) (string, int64) {
 	accessor, err := meta.Accessor(obj)
 	if err != nil {
 		return "", 0
 	}
-
 	version := accessor.GetResourceVersion()
 	if len(version) == 0 {
 		return "", 0
@@ -375,7 +458,7 @@ func GetResourceVersionKV(obj runtime.Object) (string, uint64) {
 	resourceVersion, _ := strconv.ParseUint(version, 10, 64)
 	key := GetObjectKey(obj)
 	
-	return key, resourceVersion
+	return key, int64(resourceVersion)
 }
 
 func GetObjectKey(obj runtime.Object) string {
@@ -383,17 +466,31 @@ func GetObjectKey(obj runtime.Object) string {
 	if err != nil {
 		return ""
 	}
+	objectGroup := strings.ToLower(obj.GetObjectKind().GroupVersionKind().Group)
+	objectKind := strings.ToLower(obj.GetObjectKind().GroupVersionKind().Kind)
 
-	objGroup := "abc.abc.io"
-	objPlural := "abcs"
-	key := "/registry/" + objGroup + "/" + objPlural + "/" + accessor.GetNamespace() + "/" + accessor.GetName()
+	key := "/registry/"
+
+	// TODO: implement for every core resource
+	if objectGroup == "" || objectGroup == "apps" || objectGroup == "policy" {
+		key += objectKind + "s/"
+	} else {
+		key += objectGroup + "/" + objectKind + "s/"
+	}
+	if objectKind == "service" {
+		key += "specs/"
+	}
+	key += accessor.GetNamespace() + "/" + accessor.GetName()
+
 	return key
 }
 
 // Create implements client.Client.
 func (c *client) Create(ctx context.Context, obj Object, opts ...CreateOption) error {
-	c.txnBuffer.Compare = append(c.txnBuffer.Compare, obj)
-	c.txnBuffer.Request = append(c.txnBuffer.Request, obj)
+	c.txnBuffer.ReconciledObjects = append(c.txnBuffer.ReconciledObjects, ReconciledObject{Object: obj, Action: "CREATE"})
+	if TESTING {
+		return nil
+	}
 
 	switch obj.(type) {
 	case runtime.Unstructured:
@@ -407,8 +504,10 @@ func (c *client) Create(ctx context.Context, obj Object, opts ...CreateOption) e
 
 // Update implements client.Client.
 func (c *client) Update(ctx context.Context, obj Object, opts ...UpdateOption) error {
-	c.txnBuffer.Compare = append(c.txnBuffer.Compare, obj)
-	c.txnBuffer.Request = append(c.txnBuffer.Request, obj)
+	c.txnBuffer.ReconciledObjects = append(c.txnBuffer.ReconciledObjects, ReconciledObject{Object: obj, Action: "UPDATE"})
+	if TESTING {
+		return nil
+	}
 
 	defer c.resetGroupVersionKind(obj, obj.GetObjectKind().GroupVersionKind())
 	switch obj.(type) {
@@ -423,8 +522,10 @@ func (c *client) Update(ctx context.Context, obj Object, opts ...UpdateOption) e
 
 // Delete implements client.Client.
 func (c *client) Delete(ctx context.Context, obj Object, opts ...DeleteOption) error {
-	c.txnBuffer.Compare = append(c.txnBuffer.Compare, obj)
-	c.txnBuffer.Request = append(c.txnBuffer.Request, obj)
+	c.txnBuffer.ReconciledObjects = append(c.txnBuffer.ReconciledObjects, ReconciledObject{Object: obj, Action: "DELETE"})
+	if TESTING {
+		return nil
+	}
 
 	switch obj.(type) {
 	case runtime.Unstructured:
@@ -450,8 +551,10 @@ func (c *client) DeleteAllOf(ctx context.Context, obj Object, opts ...DeleteAllO
 
 // Patch implements client.Client.
 func (c *client) Patch(ctx context.Context, obj Object, patch Patch, opts ...PatchOption) error {
-	c.txnBuffer.Compare = append(c.txnBuffer.Compare, obj)
-	c.txnBuffer.Request = append(c.txnBuffer.Request, obj)
+	c.txnBuffer.ReconciledObjects = append(c.txnBuffer.ReconciledObjects, ReconciledObject{Object: obj, Action: "PATCH"})
+	if TESTING {
+		return nil
+	}
 
 	defer c.resetGroupVersionKind(obj, obj.GetObjectKind().GroupVersionKind())
 	switch obj.(type) {
@@ -466,7 +569,7 @@ func (c *client) Patch(ctx context.Context, obj Object, patch Patch, opts ...Pat
 
 // Get implements client.Client.
 func (c *client) Get(ctx context.Context, key ObjectKey, obj Object, opts ...GetOption) error {
-	c.txnBuffer.Compare = append(c.txnBuffer.Compare, obj)
+	c.txnBuffer.ReconciledObjects = append(c.txnBuffer.ReconciledObjects, ReconciledObject{Object: obj, Action: "GET"})
 
 	if isUncached, err := c.shouldBypassCache(obj); err != nil {
 		return err

@@ -23,10 +23,7 @@ import (
 	"bytes"
 	"net/http"
 	"strings"
-	"strconv"
 	"gopkg.in/yaml.v3"
-	"time"
-	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,6 +33,11 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
+
+	// appsv1 "k8s.io/api/apps/v1"
+	// v1 "k8s.io/api/core/v1"
+	// policyv1 "k8s.io/api/policy/v1"
+	// "k8s.io/apimachinery/pkg/runtime/serializer/protobuf"
 
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -170,14 +172,6 @@ func newClient(config *rest.Config, options Options) (*client, error) {
 		return nil, fmt.Errorf("unable to construct metadata-only client for use as part of client: %w", err)
 	}
 
-	etcdClient, err := clientv3.New(clientv3.Config{
-		Endpoints:   []string{"10.224.4.175:2379", "10.224.4.176:22379", "10.224.4.177:32379"},
-		DialTimeout: 5 * time.Second,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("etcd client failed.")
-	}
-
 	c := &client{
 		typedClient: typedClient{
 			resources:  resources,
@@ -193,7 +187,6 @@ func newClient(config *rest.Config, options Options) (*client, error) {
 		},
 		scheme: options.Scheme,
 		mapper: options.Mapper,
-		etcdClient: etcdClient,
 	}
 	if options.Cache == nil || options.Cache.Reader == nil {
 		return c, nil
@@ -241,7 +234,6 @@ type client struct {
 	cacheUnstructured bool
 
 	txnBuffer		  TxnBuffer
-	etcdClient		  *clientv3.Client
 }
 
 func (c *client) shouldBypassCache(obj runtime.Object) (bool, error) {
@@ -297,198 +289,136 @@ func (c *client) RESTMapper() meta.RESTMapper {
 	return c.mapper
 }
 
-const TESTING = false
+const TXN = false
 
-func (c *client) TransformObjectToETCDValue(obj runtime.Object) (string, error) {
-	const mediaType = runtime.ContentTypeYAML
-	info, ok := runtime.SerializerInfoForMediaType(c.typedClient.resources.codecs.SupportedMediaTypes(), mediaType)
-	if !ok {
-		return "", fmt.Errorf("unable to locate encoder -- %q is not a supported media type", mediaType)
+// Commit implements client.Client.
+func (c *client) Commit(ctx context.Context) error {
+	compares := make(map[string]int64)
+	requests := make(map[string]string)
+
+	// Compose compares and requests
+	for _, reconciledObject := range c.txnBuffer.ReconciledObjects {
+		key, resourceVersion := GetKeyResourceVersion(reconciledObject.Object)
+		switch reconciledObject.Action {
+		case "CREATE":
+			PutCompare(&compares, key, int64(0))
+			value, _ := c.TransformToStorageValue(reconciledObject.Object)
+			PutRequest(&requests, key, value)
+		case "DELETE":
+			PutCompare(&compares, key, resourceVersion)
+			PutRequest(&requests, key, "")
+		case "GET":
+			PutCompare(&compares, key, resourceVersion)
+		// (STATUS)UPDATE, PATCH
+		default:
+			PutCompare(&compares, key, resourceVersion)
+			value, _ := c.TransformToStorageValue(reconciledObject.Object)
+			PutRequest(&requests, key, value)
+		}
 	}
+
+	fmt.Printf("\nNUMBER OF RECONCILED OBJECTS: %d\n", len(c.txnBuffer.ReconciledObjects))
+	if !TXN || len(requests) == 0 {
+		c.txnBuffer.ReconciledObjects = []ReconciledObject{}
+		return nil
+	}
+
+	txnSucceed := TxnRequest(compares, requests)
+	if txnSucceed {
+		fmt.Println("Transaction Succeed.")
+	} else {
+		fmt.Println("Transaction Failed.")
+	}
+
+	c.txnBuffer.ReconciledObjects = []ReconciledObject{}
+	return nil
+}
+
+func (c *client) TransformToStorageValue(obj runtime.Object) (string, error) {
+	// Encrypt Kubernetes objects
+	// if !IsCRD(obj) {
+	// 	accessor, err := meta.Accessor(obj)
+	// 	resourceVersion := accessor.GetResourceVersion()
+	// 	protoSerializer := protobuf.NewSerializer(scheme.Scheme, scheme.Scheme)
+	// 	protobufBuffer := new(bytes.Buffer)
+
+	// 	// Add CreationTimestamp for a new object
+	// 	if resourceVersion == "" {
+	// 		switch obj.GetObjectKind().GroupVersionKind().Kind {
+	// 		case "StatefulSet":
+	// 			sts := obj.(*appsv1.StatefulSet)
+	// 			sts.ObjectMeta.CreationTimestamp = metav1.Now()
+	// 		case "Service":
+	// 			svc := obj.(*v1.Service)
+	// 			svc.ObjectMeta.CreationTimestamp = metav1.Now()
+	// 		case "ConfigMap":
+	// 			cm := obj.(*v1.ConfigMap)
+	// 			cm.ObjectMeta.CreationTimestamp = metav1.Now()
+	// 		case "PodDisruptionBudget":
+	// 			pdb := obj.(*policyv1.PodDisruptionBudget)
+	// 			pdb.ObjectMeta.CreationTimestamp = metav1.Now()
+	// 		}
+	// 	}
+	// 	err = protoSerializer.Encode(obj, protobufBuffer)
+	// 	return protobufBuffer.String(), err
+	// }
+
+	// Encrypt Custom Resources
+	mediaType := runtime.ContentTypeJSON
+	info, _ := runtime.SerializerInfoForMediaType(c.typedClient.resources.codecs.SupportedMediaTypes(), mediaType)
 
 	objectGroup := obj.GetObjectKind().GroupVersionKind().Group
 	objectVersion := obj.GetObjectKind().GroupVersionKind().Version
 	groupVersion := schema.GroupVersion{Group: objectGroup, Version: objectVersion}
 
 	encoder := c.typedClient.resources.codecs.EncoderForVersion(info.Serializer, groupVersion)
-	var buf bytes.Buffer
-	err := encoder.Encode(obj, &buf)
-	if err != nil {
-		return "", fmt.Errorf("failed to encode object: %v", err)
-	}
-
-	// Serialize the etcd value.
-	serializedValue, err := yaml.Marshal(buf.String())
+	jsonBuffer := new(bytes.Buffer)
+	err := encoder.Encode(obj, jsonBuffer)
+	serializedData, err := yaml.Marshal(jsonBuffer.String())
 	if err != nil {
 		return "", fmt.Errorf("failed to serialize etcd value: %v", err)
 	}
-
-	slices := strings.Split(string(serializedValue), "\n")
-	objectYaml := ""
+	slices := strings.Split(string(serializedData), "\n")
+	objectValue := ""
 	for i := 1; i <len(slices); i++ {
 		if len(slices[i]) >= 4 {
-			objectYaml += slices[i][4:] + "\n"
+			objectValue += slices[i][4:] + "\n"
 		}
 	}
 
-	return objectYaml, nil
+	return objectValue, nil
 }
 
-// Commit implements client.Client.
-func (c *client) Commit(ctx context.Context) error {
-	fmt.Printf("\nNUMBER OF RECONCILED OBJECTS: %d\n\n", len(c.txnBuffer.ReconciledObjects))
-
+func (c *client) PreAssertOperation(ctx context.Context, obj runtime.Object, operation string) error {
 	compares := make(map[string]int64)
 	requests := make(map[string]string)
 
-	for i := 0; i < len(c.txnBuffer.ReconciledObjects); i++ {
-		reconciledObject := c.txnBuffer.ReconciledObjects[i]
-		key, resourceVersion := GetKeyResourceVersion(reconciledObject.Object)
-		switch reconciledObject.Action {
-		case "CREATE":
-			compares[key] = int64(0)
-			value, err := c.TransformObjectToETCDValue(reconciledObject.Object)
-			if err != nil {
-				return err
-			}
-			requests[key] = value
-		case "DELETE":
-			compares[key] = resourceVersion
-			requests[key] = ""
-		case "GET":
-			compares[key] = resourceVersion
-		// UPDATE, PATCH
-		default:
-			compares[key] = resourceVersion
-			value, err := c.TransformObjectToETCDValue(reconciledObject.Object)
-			if err != nil {
-				return err
-			}
-			requests[key] = value
-		}
-	}
-
-	etcdCompares := []clientv3.Cmp{}
-	for key, rv := range compares {
-		etcdCompares = append(etcdCompares, clientv3.Compare(clientv3.ModRevision(key), "=", rv))
-	}
-
-	etcdRequests := []clientv3.Op{}
-	for key, value := range requests {
-		if value == "" {
-			etcdRequests = append(etcdRequests, clientv3.OpDelete(key))	
-		} else {
-			etcdRequests = append(etcdRequests, clientv3.OpPut(key, value))
-		}
-	}
-
-	txnResponse, _ := c.etcdClient.KV.Txn(ctx).If(
-		etcdCompares...,
-	).Then(
-		etcdRequests...,
-	).Else(
-	).Commit()
-	
-	if txnResponse.Succeeded {
-		fmt.Println("Transaction succeeded. Key was either created or updated.")
+	if operation == "CREATE" {
+		key := GetObjectKey(obj)
+		PutCompare(&compares, key, int64(0))
 	} else {
-		fmt.Println("Transaction failed. No updates were made.")
+		key, rv := GetKeyResourceVersion(obj)
+		PutCompare(&compares, key, rv)
 	}
+	PutRequest(&requests, "COMPARE", "OK")
 
-	c.txnBuffer.ReconciledObjects = []ReconciledObject{}
+	txnResponse := TxnRequest(compares, requests)
+	
+	if !txnResponse {
+		c.txnBuffer.ReconciledObjects = []ReconciledObject{}
+		return fmt.Errorf("Operation cannot be executed.")
+	}
 	return nil
-
-	// txnRequest := &TxnRequest{
-	// 	Compare: compares,
-	// 	Request: requests,
-	// }
-
-	// payload, err := json.Marshal(txnRequest)
-	// if err != nil {
-	// 	fmt.Println("Error marshaling JSON:", err)
-	// 	return err
-	// }
-
-	// Create a new HTTP request with POST method and payload
-	// url := "https://10.224.4.161:6443/apis/abc.abc.io/v1/namespaces/default/abcs/txn"
-	// httpRequest, err := http.NewRequest("POST", url, bytes.NewBuffer(payload))
-	// if err != nil {
-	// 	fmt.Println("Error creating request:", err)
-	// 	return err
-	// }
-
-	// httpRequest.Header.Set("Content-Type", "application/json")
-
-	// // Send the request to the etcd server
-	// resp, err := c.typedClient.resources.httpClient.Do(httpRequest)
-	// if err != nil {
-	// 	fmt.Println("Error sending request:", err)
-	// 	return err
-	// }
-	// defer resp.Body.Close()
-
-	// fmt.Println("Request:", txnRequest)
-	// fmt.Println("Response:", resp)
-
-	/*
-	// Read the response body
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Println("Error reading response body:", err)
-		return
-	}
-
-	// Print the response status code and body
-	fmt.Println("Response status code:", resp.StatusCode)
-	fmt.Println("Response body:", string(body))
-	*/
-
-	// return nil
-}
-
-func GetKeyResourceVersion(obj runtime.Object) (string, int64) {
-	accessor, err := meta.Accessor(obj)
-	if err != nil {
-		return "", 0
-	}
-	version := accessor.GetResourceVersion()
-	if len(version) == 0 {
-		return "", 0
-	}
-	resourceVersion, _ := strconv.ParseUint(version, 10, 64)
-	key := GetObjectKey(obj)
-	
-	return key, int64(resourceVersion)
-}
-
-func GetObjectKey(obj runtime.Object) string {
-	accessor, err := meta.Accessor(obj)
-	if err != nil {
-		return ""
-	}
-	objectGroup := strings.ToLower(obj.GetObjectKind().GroupVersionKind().Group)
-	objectKind := strings.ToLower(obj.GetObjectKind().GroupVersionKind().Kind)
-
-	key := "/registry/"
-
-	// TODO: implement for every core resource
-	if objectGroup == "" || objectGroup == "apps" || objectGroup == "policy" {
-		key += objectKind + "s/"
-	} else {
-		key += objectGroup + "/" + objectKind + "s/"
-	}
-	if objectKind == "service" {
-		key += "specs/"
-	}
-	key += accessor.GetNamespace() + "/" + accessor.GetName()
-
-	return key
 }
 
 // Create implements client.Client.
 func (c *client) Create(ctx context.Context, obj Object, opts ...CreateOption) error {
 	c.txnBuffer.ReconciledObjects = append(c.txnBuffer.ReconciledObjects, ReconciledObject{Object: obj, Action: "CREATE"})
-	if TESTING {
+	if TXN {
+		err := c.PreAssertOperation(ctx, obj, "CREATE")
+		if err != nil {
+			return fmt.Errorf("Create cannot be executed.")
+		}
 		return nil
 	}
 
@@ -505,7 +435,11 @@ func (c *client) Create(ctx context.Context, obj Object, opts ...CreateOption) e
 // Update implements client.Client.
 func (c *client) Update(ctx context.Context, obj Object, opts ...UpdateOption) error {
 	c.txnBuffer.ReconciledObjects = append(c.txnBuffer.ReconciledObjects, ReconciledObject{Object: obj, Action: "UPDATE"})
-	if TESTING {
+	if TXN {
+		err := c.PreAssertOperation(ctx, obj, "UPDATE")
+		if err != nil {
+			return fmt.Errorf("Update cannot be executed.")
+		}
 		return nil
 	}
 
@@ -523,8 +457,14 @@ func (c *client) Update(ctx context.Context, obj Object, opts ...UpdateOption) e
 // Delete implements client.Client.
 func (c *client) Delete(ctx context.Context, obj Object, opts ...DeleteOption) error {
 	c.txnBuffer.ReconciledObjects = append(c.txnBuffer.ReconciledObjects, ReconciledObject{Object: obj, Action: "DELETE"})
-	if TESTING {
-		return nil
+	if TXN {
+		if !strings.Contains(GetObjectKey(obj), "persistentvolumeclaim") {
+			err := c.PreAssertOperation(ctx, obj, "DELETE")
+			if err != nil {
+				return fmt.Errorf("Delete cannot be executed.")
+			}
+			return nil
+		}
 	}
 
 	switch obj.(type) {
@@ -552,7 +492,11 @@ func (c *client) DeleteAllOf(ctx context.Context, obj Object, opts ...DeleteAllO
 // Patch implements client.Client.
 func (c *client) Patch(ctx context.Context, obj Object, patch Patch, opts ...PatchOption) error {
 	c.txnBuffer.ReconciledObjects = append(c.txnBuffer.ReconciledObjects, ReconciledObject{Object: obj, Action: "PATCH"})
-	if TESTING {
+	if TXN {
+		err := c.PreAssertOperation(ctx, obj, "PATCH")
+		if err != nil {
+			return fmt.Errorf("Patch cannot be executed.")
+		}
 		return nil
 	}
 
@@ -798,6 +742,23 @@ func (sc *subResourceClient) Create(ctx context.Context, obj Object, subResource
 
 // Update implements client.SubResourceClient
 func (sc *subResourceClient) Update(ctx context.Context, obj Object, opts ...SubResourceUpdateOption) error {
+	sc.client.txnBuffer.ReconciledObjects = append(sc.client.txnBuffer.ReconciledObjects, ReconciledObject{Object: obj, Action: "SUBRESOURCE UPDATE"})
+	if TXN {
+		// err := sc.client.PreAssertOperation(ctx, obj, "SUBRESOURCE UPDATE")
+		for i := 0; i < len(sc.client.txnBuffer.ReconciledObjects); i++ {
+			reconciledObject := sc.client.txnBuffer.ReconciledObjects[i]
+			key, _ := GetKeyResourceVersion(reconciledObject.Object)
+			if key == GetObjectKey(obj) && reconciledObject.Action == "UPDATE" {
+				// fmt.Println("OVERRIDE SHOULD BE IMPLEMENTED", GetObjectKey(obj))
+				return nil
+			}
+		}
+		// if err != nil {
+		// 	return fmt.Errorf("SubResource Update cannot be executed.")
+		// }
+		return nil
+	}
+
 	defer sc.client.resetGroupVersionKind(obj, obj.GetObjectKind().GroupVersionKind())
 	switch obj.(type) {
 	case runtime.Unstructured:
@@ -811,6 +772,11 @@ func (sc *subResourceClient) Update(ctx context.Context, obj Object, opts ...Sub
 
 // Patch implements client.SubResourceWriter.
 func (sc *subResourceClient) Patch(ctx context.Context, obj Object, patch Patch, opts ...SubResourcePatchOption) error {
+	sc.client.txnBuffer.ReconciledObjects = append(sc.client.txnBuffer.ReconciledObjects, ReconciledObject{Object: obj, Action: "SUBRESOURCE PATCH"})
+	if TXN {
+		return nil
+	}
+
 	defer sc.client.resetGroupVersionKind(obj, obj.GetObjectKind().GroupVersionKind())
 	switch obj.(type) {
 	case runtime.Unstructured:
